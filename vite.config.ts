@@ -34,6 +34,11 @@ export default defineConfig({
 	optimizeDeps: {
 		include: ["uuid", "sharp", "@gradio/client", "clsx"],
 	},
+	resolve: {
+		alias: {
+			crypto: "crypto-browserify",
+		},
+	},
 	test: {
 		workspace: [
 			{
