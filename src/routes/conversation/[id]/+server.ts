@@ -676,6 +676,8 @@ export async function POST({ request, locals, params, getClientAddress }) {
 
 				// Add billing organization to locals for the endpoint to use
 				locals.billingOrganization = userSettings?.billingOrganization;
+				// Add user-provided HF API key to locals so it overrides the server-wide token
+				locals.hfApiKey = userSettings?.hfApiKey;
 
 				const ctx: TextGenerationContext = {
 					model,

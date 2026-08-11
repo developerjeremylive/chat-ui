@@ -24,12 +24,14 @@ const settingsSchema = z.object({
 	hapticsEnabled: z.boolean().default(true),
 	hidePromptExamples: z.record(z.boolean()).default({}),
 	billingOrganization: z.string().optional(),
+	// null means "remove the saved key" (JSON.stringify can't encode undefined)
+	hfApiKey: z.string().nullable().optional(),
 });
 
 export async function POST({ request, locals }) {
 	const body = await request.json();
 
-	const { welcomeModalSeen, ...parsedSettings } = settingsSchema.parse(body);
+	const { welcomeModalSeen, hfApiKey, ...parsedSettings } = settingsSchema.parse(body);
 	const streamingMode = resolveStreamingMode(parsedSettings);
 
 	if (config.isHuggingChat) {
@@ -43,14 +45,22 @@ export async function POST({ request, locals }) {
 		streamingMode,
 	} satisfies SettingsEditable;
 
+	const unset: Record<string, true | "" | 1> = {};
+	if (hfApiKey === null) {
+		unset.hfApiKey = "";
+	}
+
 	await collections.settings.updateOne(
 		authCondition(locals),
 		{
 			$set: {
 				...settings,
+				// null removes the key instead of storing a null value
+				...(hfApiKey && { hfApiKey }),
 				...(welcomeModalSeen && { welcomeModalSeenAt: new Date() }),
 				updatedAt: new Date(),
 			},
+			...(Object.keys(unset).length > 0 && { $unset: unset }),
 			$setOnInsert: {
 				createdAt: new Date(),
 			},

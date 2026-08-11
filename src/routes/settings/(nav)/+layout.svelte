@@ -14,6 +14,8 @@
 	import LucideImage from "~icons/lucide/image";
 	import LucideHammer from "~icons/lucide/hammer";
 	import IconGear from "~icons/bi/gear-fill";
+	import LucideKeyRound from "~icons/lucide/key-round";
+	import HFKeyManager from "$lib/components/settings/HFKeyManager.svelte";
 	import { PROVIDERS_HUB_ORGS } from "@huggingface/inference";
 	import { usePublicConfig } from "$lib/utils/PublicConfig.svelte";
 
@@ -33,6 +35,7 @@
 
 	let previousPage: string = $state(base || "/");
 	let showContent: boolean = $state(false);
+	let showHFKeyManager: boolean = $state(false);
 
 	let navContainer: HTMLDivElement | undefined = $state();
 
@@ -281,6 +284,25 @@
 				<IconGear class="mr-0.5 text-xxs" />
 				Application Settings
 			</button>
+
+			<button
+				type="button"
+				onclick={() => (showHFKeyManager = true)}
+				class="group sticky bottom-0 mt-1 flex h-9 w-full flex-none items-center gap-1 rounded-lg px-3 text-[13px] text-gray-600 max-md:order-first md:rounded-xl md:px-3 dark:text-gray-300 {showHFKeyManager
+					? 'bg-gray-100! text-gray-800! dark:bg-gray-700! dark:text-gray-200!'
+					: 'bg-white hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700'}"
+				aria-label="Configure Hugging Face API key"
+			>
+				<LucideKeyRound class="mr-0.5 text-xxs" />
+				Hugging Face API Key
+				{#if $settings.hfApiKey}
+					<span
+						class="ml-auto flex-none rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-medium text-green-600 dark:text-green-400"
+					>
+						Connected
+					</span>
+				{/if}
+			</button>
 		</div>
 	{/if}
 	{#if showContent}
@@ -292,3 +314,7 @@
 		</div>
 	{/if}
 </div>
+
+{#if showHFKeyManager}
+	<HFKeyManager onclose={() => (showHFKeyManager = false)} />
+{/if}

@@ -87,6 +87,13 @@ export interface Settings extends Timestamps {
 	 * Stores the org's preferred_username. If empty/undefined, bills to personal account.
 	 */
 	billingOrganization?: string;
+
+	/**
+	 * User-provided Hugging Face API key (hf_...). When set, it overrides the
+	 * server-wide OPENAI_API_KEY for inference requests routed through Hugging Face,
+	 * and is used to display the monthly credits spent/remaining.
+	 */
+	hfApiKey?: string;
 }
 
 export type SettingsEditable = Omit<Settings, "welcomeModalSeenAt" | "createdAt" | "updatedAt">;

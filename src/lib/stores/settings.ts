@@ -23,6 +23,7 @@ type SettingsStore = {
 	directPaste: boolean;
 	hapticsEnabled: boolean;
 	billingOrganization?: string;
+	hfApiKey?: string | null;
 };
 
 type SettingsStoreWritable = Writable<SettingsStore> & {

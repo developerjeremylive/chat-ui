@@ -15,6 +15,8 @@ declare global {
 			token?: string;
 			/** Organization to bill inference requests to (from settings) */
 			billingOrganization?: string;
+			/** User-provided Hugging Face API key (from settings), overrides server-wide token */
+			hfApiKey?: string;
 		}
 
 		interface Error {

@@ -1,6 +1,9 @@
 import { config } from "$lib/server/config";
 
 export function getApiToken(locals: App.Locals | undefined) {
+	if (locals?.hfApiKey) {
+		return locals.hfApiKey;
+	}
 	if (config.USE_USER_TOKEN === "true") {
 		if (!locals?.token) {
 			throw new Error("User token not found");

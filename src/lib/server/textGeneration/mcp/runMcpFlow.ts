@@ -331,7 +331,7 @@ export async function* runMcpFlow({
 		};
 
 		const openai = new OpenAI({
-			apiKey: config.OPENAI_API_KEY || config.HF_TOKEN || "sk-",
+			apiKey: locals?.hfApiKey || config.OPENAI_API_KEY || config.HF_TOKEN || "sk-",
 			baseURL: config.OPENAI_BASE_URL,
 			fetch: captureProviderFetch,
 			defaultHeaders: {
@@ -491,9 +491,11 @@ export async function* runMcpFlow({
 					headers: {
 						"ChatUI-Conversation-ID": conv._id.toString(),
 						"X-use-cache": "false",
-						...(config.USE_USER_TOKEN === "true" && locals?.token
-							? { Authorization: `Bearer ${locals.token}` }
-							: {}),
+						...(locals?.hfApiKey
+							? { Authorization: `Bearer ${locals.hfApiKey}` }
+							: config.USE_USER_TOKEN === "true" && locals?.token
+								? { Authorization: `Bearer ${locals.token}` }
+								: {}),
 					},
 				}
 			);
@@ -689,9 +691,11 @@ export async function* runMcpFlow({
 							headers: {
 								"ChatUI-Conversation-ID": conv._id.toString(),
 								"X-use-cache": "false",
-								...(config.USE_USER_TOKEN === "true" && locals?.token
-									? { Authorization: `Bearer ${locals.token}` }
-									: {}),
+								...(locals?.hfApiKey
+									? { Authorization: `Bearer ${locals.hfApiKey}` }
+									: config.USE_USER_TOKEN === "true" && locals?.token
+										? { Authorization: `Bearer ${locals.token}` }
+										: {}),
 							},
 						}
 					);
