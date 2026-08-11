@@ -20,6 +20,10 @@ import { prepareMessagesWithFiles } from "$lib/server/textGeneration/utils/prepa
 export const endpointOAIParametersSchema = z.object({
 	weight: z.number().int().positive().default(1),
 	model: z.any(),
+	// Overrides the model id sent in the request body. Needed when the server
+	// identifies the model by a different id than the one used for URLs (e.g.
+	// llama.cpp/LM Studio serve models under their file-path id).
+	modelId: z.string().optional(),
 	type: z.literal("openai"),
 	baseURL: z.string().url().default("https://api.openai.com/v1"),
 	// Canonical auth token is OPENAI_API_KEY; keep HF_TOKEN as legacy alias
@@ -58,6 +62,7 @@ export async function endpointOai(
 		apiKey,
 		completion,
 		model,
+		modelId,
 		defaultHeaders,
 		defaultQuery,
 		multimodal,
@@ -131,12 +136,13 @@ export async function endpointOai(
 			});
 
 			// Build model ID with optional provider suffix (e.g., "model:fastest" or "model:together")
-			const baseModelId = model.id ?? model.name;
-			const modelId = provider && provider !== "auto" ? `${baseModelId}:${provider}` : baseModelId;
+			const baseModelId = modelId ?? model.id ?? model.name;
+			const modelIdWithProvider =
+				provider && provider !== "auto" ? `${baseModelId}:${provider}` : baseModelId;
 
 			const parameters = { ...model.parameters, ...generateSettings };
 			const body: CompletionCreateParamsStreaming = {
-				model: modelId,
+				model: modelIdWithProvider,
 				prompt,
 				stream: true,
 				max_tokens: parameters?.max_tokens,
@@ -208,11 +214,12 @@ export async function endpointOai(
 			const parameters = { ...model.parameters, ...generateSettings };
 
 			// Build model ID with optional provider suffix (e.g., "model:fastest" or "model:together")
-			const baseModelId = model.id ?? model.name;
-			const modelId = provider && provider !== "auto" ? `${baseModelId}:${provider}` : baseModelId;
+			const baseModelId = modelId ?? model.id ?? model.name;
+			const modelIdWithProvider =
+				provider && provider !== "auto" ? `${baseModelId}:${provider}` : baseModelId;
 
 			const body = {
-				model: modelId,
+				model: modelIdWithProvider,
 				messages: messagesOpenAI,
 				stream: streamingSupported,
 				// Support two different ways of specifying token limits depending on the model

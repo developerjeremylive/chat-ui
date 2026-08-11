@@ -171,6 +171,36 @@ const getModelOverrides = (): ModelOverride[] => {
 	}
 };
 
+type ExtraProvider = {
+	name?: string;
+	baseURL: string;
+};
+
+const getExtraProviders = (): ExtraProvider[] => {
+	const raw = (Reflect.get(config, "OPENAI_EXTRA_BASE_URLS") as string | undefined) ?? "";
+
+	if (!raw.trim()) {
+		return [];
+	}
+
+	try {
+		const parsed = JSON5.parse(sanitizeJSONEnv(raw, "[]"));
+		if (!Array.isArray(parsed)) {
+			throw new Error("expected an array");
+		}
+		return parsed
+			.map((entry) =>
+				typeof entry === "string"
+					? { baseURL: entry.replace(/\/$/, "") }
+					: { name: entry?.name, baseURL: String(entry?.baseURL ?? "").replace(/\/$/, "") }
+			)
+			.filter((entry) => entry.baseURL.length > 0);
+	} catch (error) {
+		logger.error(error, "[models] Failed to parse OPENAI_EXTRA_BASE_URLS");
+		return [];
+	}
+};
+
 export type ProcessedModel = InternalProcessedModel;
 
 export let models: ProcessedModel[] = [];
@@ -277,6 +307,65 @@ const buildModels = async (): Promise<ProcessedModel[]> => {
 		}) as ModelConfig[];
 
 		const overrides = getModelOverrides();
+
+		// Load additional OpenAI-compatible providers (e.g. a local LM Studio or
+		// llama.cpp server) and append their models to the router's list.
+		for (const provider of getExtraProviders()) {
+			try {
+				const res = await fetch(`${provider.baseURL}/models`, {
+					headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+					signal: AbortSignal.timeout(10_000),
+				});
+				if (!res.ok) {
+					throw new Error(`GET ${provider.baseURL}/models: ${res.status} ${res.statusText}`);
+				}
+				const { data } = listSchema.parse(await res.json());
+				logger.info(
+					{ provider: provider.name ?? provider.baseURL, count: data.length },
+					"[models] Extra provider models loaded"
+				);
+
+				const existingIds = new Set(modelsRaw.map((m) => m.id));
+				modelsRaw = [
+					...modelsRaw,
+					...data.map((m) => {
+						// llama.cpp serves models under their file-path id; derive a
+						// URL-safe slug for chat-ui while keeping the original for the body.
+						const originalId = m.id;
+						const baseSlug = (m.id.split(/[\\/]/).pop() ?? m.id)
+							.replace(/\.gguf$/i, "")
+							.replace(/\s+/g, "-");
+						let slug = baseSlug;
+						let n = 2;
+						while (existingIds.has(slug)) {
+							slug = `${baseSlug}-${n++}`;
+						}
+						existingIds.add(slug);
+						return {
+							id: slug,
+							name: slug,
+							displayName: slug,
+							description: m.description ?? `Local model via ${provider.name ?? provider.baseURL}`,
+							providers: m.providers,
+							multimodal: false,
+							supportsTools: false,
+							endpoints: [
+								{
+									type: "openai" as const,
+									baseURL: provider.baseURL,
+									modelId: originalId,
+								},
+							],
+						} as ModelConfig;
+					}),
+				];
+			} catch (error) {
+				logger.error(
+					error,
+					`[models] Failed to load models from extra provider ${provider.name ?? provider.baseURL}`
+				);
+			}
+		}
 
 		if (overrides.length) {
 			const overrideMap = new Map<string, ModelOverride>();
