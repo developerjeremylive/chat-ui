@@ -7,6 +7,7 @@ import endpoints, { endpointSchema, type Endpoint } from "./endpoints/endpoints"
 import JSON5 from "json5";
 import { logger } from "$lib/server/logger";
 import { makeRouterEndpoint } from "$lib/server/router/endpoint";
+import { listInstalledModels } from "./lmstudioDownload";
 
 type Optional<T, K extends keyof T> = Pick<Partial<T>, K> & Omit<T, K>;
 
@@ -356,6 +357,7 @@ const buildRouterModelsRaw = async (): Promise<ModelConfig[]> => {
 
 const buildExtraProviderModelsRaw = async (existingIds: Set<string>): Promise<ModelConfig[]> => {
 	const extra: ModelConfig[] = [];
+	const providerModelBaseNames = new Set<string>();
 
 	// Load additional OpenAI-compatible providers (e.g. a local LM Studio or
 	// llama.cpp server) and append their models to the router's list.
@@ -379,6 +381,7 @@ const buildExtraProviderModelsRaw = async (existingIds: Set<string>): Promise<Mo
 				// llama.cpp serves models under their file-path id; derive a
 				// URL-safe slug for chat-ui while keeping the original for the body.
 				const originalId = m.id;
+				providerModelBaseNames.add((originalId.split(/[\\/]/).pop() ?? originalId).toLowerCase());
 				const baseSlug = (m.id.split(/[\\/]/).pop() ?? m.id)
 					.replace(/\.gguf$/i, "")
 					.replace(/\s+/g, "-");
@@ -411,6 +414,61 @@ const buildExtraProviderModelsRaw = async (existingIds: Set<string>): Promise<Mo
 				error,
 				`[models] Failed to load models from extra provider ${provider.name ?? provider.baseURL}`
 			);
+		}
+	}
+
+	// Register GGUF files found in the local model folders (LM Studio default
+	// dir + LMSTUDIO_MODELS_DIR) so freshly downloaded models show up in the
+	// model picker even before the local server has been asked to load them.
+	const lmStudioConfig = getLmStudioConfig();
+	if (lmStudioConfig) {
+		try {
+			const installed = await listInstalledModels();
+			if (installed.length > 0) {
+				const openaiBase = lmStudioConfig.base.replace(/\/api\/v1$/, "") + "/v1";
+				const category =
+					getExtraProviders().find((p) => p.baseURL === openaiBase)?.name ?? hostnameOf(openaiBase);
+				logger.info({ count: installed.length }, "[models] Registering local GGUF models");
+
+				for (const file of installed) {
+					const fileName = file.key.split(/[\\/]/).pop() ?? file.key;
+					// Skip files the provider already lists (same basename) and
+					// multimodal projector files, which are not chat models.
+					if (
+						providerModelBaseNames.has(fileName.toLowerCase()) ||
+						fileName.startsWith("mmproj-")
+					) {
+						continue;
+					}
+					const baseSlug = fileName.replace(/\.gguf$/i, "").replace(/\s+/g, "-");
+					let slug = baseSlug;
+					let n = 2;
+					while (existingIds.has(slug)) {
+						slug = `${baseSlug}-${n++}`;
+					}
+					existingIds.add(slug);
+					extra.push({
+						id: slug,
+						name: slug,
+						displayName: file.displayName ?? baseSlug,
+						description: file.sizeBytes
+							? `Local GGUF model (${(file.sizeBytes / 1e9).toFixed(1)} GB)`
+							: "Local GGUF model",
+						category,
+						multimodal: false,
+						supportsTools: false,
+						endpoints: [
+							{
+								type: "openai" as const,
+								baseURL: openaiBase,
+								modelId: file.key,
+							},
+						],
+					} as ModelConfig);
+				}
+			}
+		} catch (error) {
+			logger.error(error, "[models] Failed to scan local model folders");
 		}
 	}
 
