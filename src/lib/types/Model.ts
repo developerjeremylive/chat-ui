@@ -14,6 +14,7 @@ export type Model = Pick<
 	| "promptExamples"
 	| "description"
 	| "logoUrl"
+	| "category"
 	| "modelUrl"
 	| "datasetUrl"
 	| "preprompt"

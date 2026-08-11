@@ -16,6 +16,14 @@ const sanitizeJSONEnv = (val: string, fallback: string) => {
 	return unquoted || fallback;
 };
 
+const hostnameOf = (url: string): string => {
+	try {
+		return new URL(url).hostname;
+	} catch {
+		return "";
+	}
+};
+
 const modelConfig = z.object({
 	/** Used as an identifier in DB */
 	id: z.string().optional(),
@@ -23,6 +31,8 @@ const modelConfig = z.object({
 	name: z.string().default(""),
 	displayName: z.string().min(1).optional(),
 	description: z.string().min(1).optional(),
+	// Grouping label for the UI model selector (e.g. "Hugging Face" or "LM Studio")
+	category: z.string().min(1).optional(),
 	logoUrl: z.string().url().optional(),
 	websiteUrl: z.string().url().optional(),
 	modelUrl: z.string().url().optional(),
@@ -88,6 +98,11 @@ const openaiBaseUrl = config.OPENAI_BASE_URL
 	? config.OPENAI_BASE_URL.replace(/\/$/, "")
 	: undefined;
 const isHFRouter = openaiBaseUrl === "https://router.huggingface.co/v1";
+
+// Canonical auth token is OPENAI_API_KEY; keep HF_TOKEN as legacy alias
+const authToken = config.OPENAI_API_KEY || config.HF_TOKEN;
+
+const routerCategory = isHFRouter ? "Hugging Face" : hostnameOf(openaiBaseUrl ?? "");
 
 const listSchema = z
 	.object({
@@ -201,6 +216,30 @@ const getExtraProviders = (): ExtraProvider[] => {
 	}
 };
 
+/**
+ * Derives the LM Studio REST API base (e.g. `http://localhost:1234/api/v1`)
+ * from the first `OPENAI_EXTRA_BASE_URLS` entry that looks like LM Studio.
+ * Returns `undefined` when no extra provider is configured.
+ */
+export const getLmStudioRESTBase = (): string | undefined => {
+	const providers = getExtraProviders();
+	if (providers.length === 0) {
+		return undefined;
+	}
+
+	// Prefer a provider explicitly named "LM Studio", then any localhost one
+	const picked =
+		providers.find((p) => p.name?.toLowerCase().includes("lm studio")) ??
+		providers.find((p) => {
+			const host = hostnameOf(p.baseURL);
+			return host === "localhost" || host === "127.0.0.1";
+		}) ??
+		providers[0];
+
+	// baseURL is the OpenAI-compatible `/v1` endpoint; the REST API lives one level up
+	return picked.baseURL.replace(/\/v1$/, "") + "/api/v1";
+};
+
 export type ProcessedModel = InternalProcessedModel;
 
 export let models: ProcessedModel[] = [];
@@ -233,7 +272,7 @@ const resolveTaskModel = (modelList: ProcessedModel[]) => {
 	return modelList[0];
 };
 
-const buildModels = async (): Promise<ProcessedModel[]> => {
+const buildRouterModelsRaw = async (): Promise<ModelConfig[]> => {
 	if (!openaiBaseUrl) {
 		logger.error(
 			"OPENAI_BASE_URL is required. Set it to an OpenAI-compatible base (e.g., https://router.huggingface.co/v1)."
@@ -241,238 +280,272 @@ const buildModels = async (): Promise<ProcessedModel[]> => {
 		throw new Error("OPENAI_BASE_URL not set");
 	}
 
-	try {
-		const baseURL = openaiBaseUrl;
-		logger.info({ baseURL }, "[models] Using OpenAI-compatible base URL");
+	const baseURL = openaiBaseUrl;
+	logger.info({ baseURL }, "[models] Using OpenAI-compatible base URL");
 
-		// Canonical auth token is OPENAI_API_KEY; keep HF_TOKEN as legacy alias
-		const authToken = config.OPENAI_API_KEY || config.HF_TOKEN;
-
-		// Use auth token from the start if available to avoid rate limiting issues
-		// Some APIs rate-limit unauthenticated requests more aggressively
-		const response = await fetch(`${baseURL}/models`, {
-			headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-		});
-		logger.info({ status: response.status }, "[models] First fetch status");
-		if (!response.ok && response.status === 401 && !authToken) {
-			// If we get 401 and didn't have a token, there's nothing we can do
-			throw new Error(
-				`Failed to fetch ${baseURL}/models: ${response.status} ${response.statusText} (no auth token available)`
-			);
-		}
-		if (!response.ok) {
-			throw new Error(
-				`Failed to fetch ${baseURL}/models: ${response.status} ${response.statusText}`
-			);
-		}
-		const json = await response.json();
-		logger.info({ keys: Object.keys(json || {}) }, "[models] Response keys");
-
-		const parsed = listSchema.parse(json);
-		logger.info({ count: parsed.data.length }, "[models] Parsed models count");
-
-		let modelsRaw = parsed.data.map((m) => {
-			let logoUrl: string | undefined = undefined;
-			if (isHFRouter && m.id.includes("/")) {
-				const org = m.id.split("/")[0];
-				logoUrl = `https://huggingface.co/api/avatars/${encodeURIComponent(org)}`;
-			}
-
-			const inputModalities = (m.architecture?.input_modalities ?? []).map((modality) =>
-				modality.toLowerCase()
-			);
-			const supportsImageInput =
-				inputModalities.includes("image") || inputModalities.includes("vision");
-
-			// If any provider supports tools, consider the model as supporting tools
-			const supportsTools = Boolean((m.providers ?? []).some((p) => p?.supports_tools === true));
-			return {
-				id: m.id,
-				name: m.id,
-				displayName: m.id,
-				description: m.description,
-				logoUrl,
-				providers: m.providers,
-				multimodal: supportsImageInput,
-				multimodalAcceptedMimetypes: supportsImageInput ? ["image/*"] : undefined,
-				supportsTools,
-				endpoints: [
-					{
-						type: "openai" as const,
-						baseURL,
-						// apiKey will be taken from OPENAI_API_KEY or HF_TOKEN automatically
-					},
-				],
-			} as ModelConfig;
-		}) as ModelConfig[];
-
-		const overrides = getModelOverrides();
-
-		// Load additional OpenAI-compatible providers (e.g. a local LM Studio or
-		// llama.cpp server) and append their models to the router's list.
-		for (const provider of getExtraProviders()) {
-			try {
-				const res = await fetch(`${provider.baseURL}/models`, {
-					headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-					signal: AbortSignal.timeout(10_000),
-				});
-				if (!res.ok) {
-					throw new Error(`GET ${provider.baseURL}/models: ${res.status} ${res.statusText}`);
-				}
-				const { data } = listSchema.parse(await res.json());
-				logger.info(
-					{ provider: provider.name ?? provider.baseURL, count: data.length },
-					"[models] Extra provider models loaded"
-				);
-
-				const existingIds = new Set(modelsRaw.map((m) => m.id));
-				modelsRaw = [
-					...modelsRaw,
-					...data.map((m) => {
-						// llama.cpp serves models under their file-path id; derive a
-						// URL-safe slug for chat-ui while keeping the original for the body.
-						const originalId = m.id;
-						const baseSlug = (m.id.split(/[\\/]/).pop() ?? m.id)
-							.replace(/\.gguf$/i, "")
-							.replace(/\s+/g, "-");
-						let slug = baseSlug;
-						let n = 2;
-						while (existingIds.has(slug)) {
-							slug = `${baseSlug}-${n++}`;
-						}
-						existingIds.add(slug);
-						return {
-							id: slug,
-							name: slug,
-							displayName: slug,
-							description: m.description ?? `Local model via ${provider.name ?? provider.baseURL}`,
-							providers: m.providers,
-							multimodal: false,
-							supportsTools: false,
-							endpoints: [
-								{
-									type: "openai" as const,
-									baseURL: provider.baseURL,
-									modelId: originalId,
-								},
-							],
-						} as ModelConfig;
-					}),
-				];
-			} catch (error) {
-				logger.error(
-					error,
-					`[models] Failed to load models from extra provider ${provider.name ?? provider.baseURL}`
-				);
-			}
-		}
-
-		if (overrides.length) {
-			const overrideMap = new Map<string, ModelOverride>();
-			for (const override of overrides) {
-				for (const key of [override.id, override.name]) {
-					const trimmed = key?.trim();
-					if (trimmed) overrideMap.set(trimmed, override);
-				}
-			}
-
-			modelsRaw = modelsRaw.map((model) => {
-				const override = overrideMap.get(model.id ?? "") ?? overrideMap.get(model.name ?? "");
-				if (!override) return model;
-
-				const { id, name, ...rest } = override;
-				void id;
-				void name;
-
-				return {
-					...model,
-					...rest,
-				};
-			});
-		}
-
-		const builtModels = await Promise.all(
-			modelsRaw.map((e) =>
-				processModel(e)
-					.then(addEndpoint)
-					.then(async (m) => ({
-						...m,
-						hasInferenceAPI: inferenceApiIds.includes(m.id ?? m.name),
-						// router decoration added later
-						isRouter: false as boolean,
-					}))
-			)
+	// Use auth token from the start if available to avoid rate limiting issues
+	// Some APIs rate-limit unauthenticated requests more aggressively
+	const response = await fetch(`${baseURL}/models`, {
+		headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+	});
+	logger.info({ status: response.status }, "[models] First fetch status");
+	if (!response.ok && response.status === 401 && !authToken) {
+		// If we get 401 and didn't have a token, there's nothing we can do
+		throw new Error(
+			`Failed to fetch ${baseURL}/models: ${response.status} ${response.statusText} (no auth token available)`
 		);
+	}
+	if (!response.ok) {
+		throw new Error(
+			`Failed to fetch ${baseURL}/models: ${response.status} ${response.statusText}`
+		);
+	}
+	const json = await response.json();
+	logger.info({ keys: Object.keys(json || {}) }, "[models] Response keys");
 
-		const routerRoutesPath = (config.LLM_ROUTER_ROUTES_PATH || "").trim();
-		const routerLabel = (config.PUBLIC_LLM_ROUTER_DISPLAY_NAME || "Omni").trim() || "Omni";
-		const routerLogo = (config.PUBLIC_LLM_ROUTER_LOGO_URL || "").trim();
-		const routerAliasId = (config.PUBLIC_LLM_ROUTER_ALIAS_ID || "omni").trim() || "omni";
-		const routerMultimodalEnabled =
-			(config.LLM_ROUTER_ENABLE_MULTIMODAL || "").toLowerCase() === "true";
-		const routerToolsEnabled = (config.LLM_ROUTER_ENABLE_TOOLS || "").toLowerCase() === "true";
+	const parsed = listSchema.parse(json);
+	logger.info({ count: parsed.data.length }, "[models] Parsed models count");
 
-		let decorated = builtModels as ProcessedModel[];
-
-		if (routerRoutesPath) {
-			// Build a minimal model config for the alias
-			const aliasRaw = {
-				id: routerAliasId,
-				name: routerAliasId,
-				displayName: routerLabel,
-				description: "Automatically routes your messages to the best model for your request.",
-				logoUrl: routerLogo || undefined,
-				preprompt: "",
-				endpoints: [
-					{
-						type: "openai" as const,
-						baseURL: openaiBaseUrl,
-					},
-				],
-				// Keep the alias visible
-				unlisted: false,
-			} as ModelConfig;
-
-			if (routerMultimodalEnabled) {
-				aliasRaw.multimodal = true;
-				aliasRaw.multimodalAcceptedMimetypes = ["image/*"];
-			}
-
-			if (routerToolsEnabled) {
-				aliasRaw.supportsTools = true;
-			}
-
-			// Apply MODELS overrides to the router alias too, so flags like
-			// supportsArtifacts can be set on it like on any other model
-			const aliasOverride = getModelOverrides().find(
-				(o) => o.id?.trim() === routerAliasId || o.name?.trim() === routerAliasId
-			);
-			if (aliasOverride) {
-				const { id, name, ...rest } = aliasOverride;
-				void id;
-				void name;
-				Object.assign(aliasRaw, rest);
-			}
-
-			const aliasBase = await processModel(aliasRaw);
-			// Create a self-referential ProcessedModel for the router endpoint
-			const aliasModel: ProcessedModel = {
-				...aliasBase,
-				isRouter: true,
-				hasInferenceAPI: false,
-				// getEndpoint uses the router wrapper regardless of the endpoints array
-				getEndpoint: async (): Promise<Endpoint> => makeRouterEndpoint(aliasModel),
-			} as ProcessedModel;
-
-			// Put alias first
-			decorated = [aliasModel, ...decorated];
+	return parsed.data.map((m) => {
+		let logoUrl: string | undefined = undefined;
+		if (isHFRouter && m.id.includes("/")) {
+			const org = m.id.split("/")[0];
+			logoUrl = `https://huggingface.co/api/avatars/${encodeURIComponent(org)}`;
 		}
 
-		return decorated;
-	} catch (e) {
-		logger.error(e, "Failed to load models from OpenAI base URL");
-		throw e;
+		const inputModalities = (m.architecture?.input_modalities ?? []).map((modality) =>
+			modality.toLowerCase()
+		);
+		const supportsImageInput =
+			inputModalities.includes("image") || inputModalities.includes("vision");
+
+		// If any provider supports tools, consider the model as supporting tools
+		const supportsTools = Boolean((m.providers ?? []).some((p) => p?.supports_tools === true));
+		return {
+			id: m.id,
+			name: m.id,
+			displayName: m.id,
+			description: m.description,
+			logoUrl,
+			category: routerCategory,
+			providers: m.providers,
+			multimodal: supportsImageInput,
+			multimodalAcceptedMimetypes: supportsImageInput ? ["image/*"] : undefined,
+			supportsTools,
+			endpoints: [
+				{
+					type: "openai" as const,
+					baseURL,
+					// apiKey will be taken from OPENAI_API_KEY or HF_TOKEN automatically
+				},
+			],
+		} as ModelConfig;
+	}) as ModelConfig[];
+};
+
+const buildExtraProviderModelsRaw = async (existingIds: Set<string>): Promise<ModelConfig[]> => {
+	const extra: ModelConfig[] = [];
+
+	// Load additional OpenAI-compatible providers (e.g. a local LM Studio or
+	// llama.cpp server) and append their models to the router's list.
+	for (const provider of getExtraProviders()) {
+		try {
+			const res = await fetch(`${provider.baseURL}/models`, {
+				headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+				signal: AbortSignal.timeout(10_000),
+			});
+			if (!res.ok) {
+				throw new Error(`GET ${provider.baseURL}/models: ${res.status} ${res.statusText}`);
+			}
+			const { data } = listSchema.parse(await res.json());
+			logger.info(
+				{ provider: provider.name ?? provider.baseURL, count: data.length },
+				"[models] Extra provider models loaded"
+			);
+
+			const category = provider.name ?? hostnameOf(provider.baseURL);
+			for (const m of data) {
+				// llama.cpp serves models under their file-path id; derive a
+				// URL-safe slug for chat-ui while keeping the original for the body.
+				const originalId = m.id;
+				const baseSlug = (m.id.split(/[\\/]/).pop() ?? m.id)
+					.replace(/\.gguf$/i, "")
+					.replace(/\s+/g, "-");
+				let slug = baseSlug;
+				let n = 2;
+				while (existingIds.has(slug)) {
+					slug = `${baseSlug}-${n++}`;
+				}
+				existingIds.add(slug);
+				extra.push({
+					id: slug,
+					name: slug,
+					displayName: slug,
+					description: m.description ?? `Local model via ${provider.name ?? provider.baseURL}`,
+					category,
+					providers: m.providers,
+					multimodal: false,
+					supportsTools: false,
+					endpoints: [
+						{
+							type: "openai" as const,
+							baseURL: provider.baseURL,
+							modelId: originalId,
+						},
+					],
+				} as ModelConfig);
+			}
+		} catch (error) {
+			logger.error(
+				error,
+				`[models] Failed to load models from extra provider ${provider.name ?? provider.baseURL}`
+			);
+		}
 	}
+
+	return extra;
+};
+
+const finalizeModels = async (modelsRaw: ModelConfig[]): Promise<ProcessedModel[]> => {
+	const overrides = getModelOverrides();
+
+	if (overrides.length) {
+		const overrideMap = new Map<string, ModelOverride>();
+		for (const override of overrides) {
+			for (const key of [override.id, override.name]) {
+				const trimmed = key?.trim();
+				if (trimmed) overrideMap.set(trimmed, override);
+			}
+		}
+
+		modelsRaw = modelsRaw.map((model) => {
+			const override = overrideMap.get(model.id ?? "") ?? overrideMap.get(model.name ?? "");
+			if (!override) return model;
+
+			const { id, name, ...rest } = override;
+			void id;
+			void name;
+
+			return {
+				...model,
+				...rest,
+			};
+		});
+	}
+
+	const builtModels = await Promise.all(
+		modelsRaw.map((e) =>
+			processModel(e)
+				.then(addEndpoint)
+				.then(async (m) => ({
+					...m,
+					hasInferenceAPI: inferenceApiIds.includes(m.id ?? m.name),
+					// router decoration added later
+					isRouter: false as boolean,
+				}))
+		)
+	);
+
+	const routerRoutesPath = (config.LLM_ROUTER_ROUTES_PATH || "").trim();
+	const routerLabel = (config.PUBLIC_LLM_ROUTER_DISPLAY_NAME || "Omni").trim() || "Omni";
+	const routerLogo = (config.PUBLIC_LLM_ROUTER_LOGO_URL || "").trim();
+	const routerAliasId = (config.PUBLIC_LLM_ROUTER_ALIAS_ID || "omni").trim() || "omni";
+	const routerMultimodalEnabled =
+		(config.LLM_ROUTER_ENABLE_MULTIMODAL || "").toLowerCase() === "true";
+	const routerToolsEnabled = (config.LLM_ROUTER_ENABLE_TOOLS || "").toLowerCase() === "true";
+
+	let decorated = builtModels as ProcessedModel[];
+
+	if (routerRoutesPath) {
+		// Build a minimal model config for the alias
+		const aliasRaw = {
+			id: routerAliasId,
+			name: routerAliasId,
+			displayName: routerLabel,
+			description: "Automatically routes your messages to the best model for your request.",
+			logoUrl: routerLogo || undefined,
+			category: routerCategory,
+			preprompt: "",
+			endpoints: [
+				{
+					type: "openai" as const,
+					baseURL: openaiBaseUrl,
+				},
+			],
+			// Keep the alias visible
+			unlisted: false,
+		} as ModelConfig;
+
+		if (routerMultimodalEnabled) {
+			aliasRaw.multimodal = true;
+			aliasRaw.multimodalAcceptedMimetypes = ["image/*"];
+		}
+
+		if (routerToolsEnabled) {
+			aliasRaw.supportsTools = true;
+		}
+
+		// Apply MODELS overrides to the router alias too, so flags like
+		// supportsArtifacts can be set on it like on any other model
+		const aliasOverride = getModelOverrides().find(
+			(o) => o.id?.trim() === routerAliasId || o.name?.trim() === routerAliasId
+		);
+		if (aliasOverride) {
+			const { id, name, ...rest } = aliasOverride;
+			void id;
+			void name;
+			Object.assign(aliasRaw, rest);
+		}
+
+		const aliasBase = await processModel(aliasRaw);
+		// Create a self-referential ProcessedModel for the router endpoint
+		const aliasModel: ProcessedModel = {
+			...aliasBase,
+			isRouter: true,
+			hasInferenceAPI: false,
+			// getEndpoint uses the router wrapper regardless of the endpoints array
+			getEndpoint: async (): Promise<Endpoint> => makeRouterEndpoint(aliasModel),
+		} as ProcessedModel;
+
+		// Put alias first
+		decorated = [aliasModel, ...decorated];
+	}
+
+	return decorated;
+};
+
+// Raw router models are cached so extra-provider refreshes can rebuild the list
+// without re-fetching the upstream router on every request.
+let routerModelsRaw: ModelConfig[] = [];
+
+const routerModelIds = (): Set<string> =>
+	new Set(routerModelsRaw.map((m) => m.id).filter((id): id is string => id !== undefined));
+
+const buildModels = async (): Promise<ProcessedModel[]> => {
+	routerModelsRaw = await buildRouterModelsRaw();
+	const extraRaw = await buildExtraProviderModelsRaw(routerModelIds());
+	return finalizeModels([...routerModelsRaw, ...extraRaw]);
+};
+
+export const refreshExtraProviderModels = async (): Promise<{ count: number }> => {
+	if (routerModelsRaw.length === 0) {
+		throw new Error("Cannot refresh extra provider models: base model list is empty");
+	}
+
+	const extraRaw = await buildExtraProviderModelsRaw(routerModelIds());
+	const rebuilt = await finalizeModels([...routerModelsRaw, ...extraRaw]);
+
+	models = rebuilt;
+	defaultModel = models[0];
+	taskModel = resolveTaskModel(models);
+	validModelIdSchema = createValidModelIdSchema(models);
+
+	logger.info(
+		{ total: models.length, extra: extraRaw.length },
+		"[models] Extra provider models refreshed"
+	);
+
+	return { count: extraRaw.length };
 };
 
 // Skip the initial fetch during `vite build`: SvelteKit's analyse phase imports this

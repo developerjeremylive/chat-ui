@@ -17,6 +17,7 @@ export function serializeModelSummary(model: ProcessedModel): GETModelsResponse[
 		displayName: model.displayName,
 		description: model.description,
 		logoUrl: model.logoUrl,
+		category: model.category,
 		promptExamples: model.promptExamples,
 		preprompt: model.preprompt,
 		multimodal: model.multimodal,

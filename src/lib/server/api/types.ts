@@ -13,6 +13,7 @@ export type GETModelsResponse = Array<{
 	displayName: string;
 	description?: string;
 	logoUrl?: string;
+	category?: string;
 	promptExamples?: { title: string; prompt: string }[];
 	preprompt?: string;
 	multimodal: boolean;

@@ -135,6 +135,14 @@ export function useAPIClient({
 			config: endpoint(fetcher, `${baseUrl}/debug/config`),
 		},
 		export: endpoint(fetcher, `${baseUrl}/export`),
+		lmstudio: {
+			...endpoint(fetcher, `${baseUrl}/lmstudio`),
+			download: endpoint(fetcher, `${baseUrl}/lmstudio/download`),
+			catalog: endpoint(fetcher, `${baseUrl}/lmstudio/catalog`),
+			refresh: endpoint(fetcher, `${baseUrl}/lmstudio/refresh`),
+			"download-status": (params: { jobId: string }) =>
+				endpoint(fetcher, `${baseUrl}/lmstudio/download/status/${params.jobId}`),
+		},
 	};
 }
 

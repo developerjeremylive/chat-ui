@@ -13,6 +13,7 @@
 	import CarbonChevronLeft from "~icons/carbon/chevron-left";
 	import LucideImage from "~icons/lucide/image";
 	import LucideHammer from "~icons/lucide/hammer";
+	import LucideDownload from "~icons/lucide/download";
 	import IconGear from "~icons/bi/gear-fill";
 	import LucideKeyRound from "~icons/lucide/key-round";
 	import HFKeyManager from "$lib/components/settings/HFKeyManager.svelte";
@@ -104,6 +105,24 @@
 	let modelFilter = $state("");
 	const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ");
 	let queryTokens = $derived(normalize(modelFilter).trim().split(/\s+/).filter(Boolean));
+
+	// Group models by provider category (e.g. "Hugging Face" vs "LM Studio") so
+	// the sidebar shows a header per source instead of one flat list.
+	const modelGroups = $derived.by(() => {
+		const groups = new Map<string, typeof data.models>();
+		for (const model of data.models) {
+			if (model.unlisted) continue;
+			const haystack = normalize(`${model.id} ${model.name ?? ""} ${model.displayName ?? ""}`);
+			if (!queryTokens.every((q) => haystack.includes(q))) continue;
+			const category = model.category?.trim() || "Other";
+			const list = groups.get(category) ?? [];
+			list.push(model);
+			groups.set(category, list);
+		}
+		return [...groups.entries()];
+	});
+	// Only render category headers when the list actually mixes sources
+	const showCategoryHeaders = $derived(modelGroups.length > 1);
 </script>
 
 <div
@@ -164,12 +183,15 @@
 				/>
 			</div>
 
-			{#each data.models
-				.filter((el) => !el.unlisted)
-				.filter((el) => {
-					const haystack = normalize(`${el.id} ${el.name ?? ""} ${el.displayName ?? ""}`);
-					return queryTokens.every((q) => haystack.includes(q));
-				}) as model}
+			{#each modelGroups as [category, models] (category)}
+				{#if showCategoryHeaders}
+					<h4
+						class="px-3 pt-2 pb-1 text-xs font-semibold tracking-wide text-gray-600 md:text-left dark:text-gray-500"
+					>
+						{category}
+					</h4>
+				{/if}
+				{#each models as model (model.id)}
 				<button
 					type="button"
 					onclick={() => goto(`${base}/settings/${model.id}`)}
@@ -270,7 +292,21 @@
 						</div>
 					{/if}
 				</button>
+				{/each}
 			{/each}
+
+			<button
+				type="button"
+				onclick={() => goto(`${base}/settings/lm-studio`)}
+				class="group sticky bottom-0 mt-1 flex h-9 w-full flex-none items-center gap-1 rounded-lg px-3 text-[13px] text-gray-600 max-md:order-first md:rounded-xl md:px-3 dark:text-gray-300 {page
+					.url.pathname === `${base}/settings/lm-studio`
+					? 'bg-gray-100! text-gray-800! dark:bg-gray-700! dark:text-gray-200!'
+					: 'bg-white hover:bg-gray-100 dark:bg-gray-800 dark:hover:bg-gray-700'}"
+				aria-label="Manage LM Studio models"
+			>
+				<LucideDownload class="mr-0.5 text-xxs" />
+				LM Studio models
+			</button>
 
 			<button
 				type="button"
