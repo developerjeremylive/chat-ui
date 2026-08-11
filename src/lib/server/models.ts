@@ -189,6 +189,7 @@ const getModelOverrides = (): ModelOverride[] => {
 type ExtraProvider = {
 	name?: string;
 	baseURL: string;
+	apiKey?: string;
 };
 
 const getExtraProviders = (): ExtraProvider[] => {
@@ -207,7 +208,11 @@ const getExtraProviders = (): ExtraProvider[] => {
 			.map((entry) =>
 				typeof entry === "string"
 					? { baseURL: entry.replace(/\/$/, "") }
-					: { name: entry?.name, baseURL: String(entry?.baseURL ?? "").replace(/\/$/, "") }
+					: {
+							name: entry?.name,
+							baseURL: String(entry?.baseURL ?? "").replace(/\/$/, ""),
+							apiKey: entry?.apiKey || entry?.APIKey,
+						}
 			)
 			.filter((entry) => entry.baseURL.length > 0);
 	} catch (error) {
@@ -216,12 +221,17 @@ const getExtraProviders = (): ExtraProvider[] => {
 	}
 };
 
+type LmStudioConfig = {
+	base: string;
+	apiKey?: string;
+};
+
 /**
- * Derives the LM Studio REST API base (e.g. `http://localhost:1234/api/v1`)
- * from the first `OPENAI_EXTRA_BASE_URLS` entry that looks like LM Studio.
- * Returns `undefined` when no extra provider is configured.
+ * Derives the LM Studio REST API config (`http://host:port/api/v1` + optional
+ * api key) from the first `OPENAI_EXTRA_BASE_URLS` entry that looks like LM
+ * Studio. Returns `undefined` when no extra provider is configured.
  */
-export const getLmStudioRESTBase = (): string | undefined => {
+export const getLmStudioConfig = (): LmStudioConfig | undefined => {
 	const providers = getExtraProviders();
 	if (providers.length === 0) {
 		return undefined;
@@ -237,7 +247,10 @@ export const getLmStudioRESTBase = (): string | undefined => {
 		providers[0];
 
 	// baseURL is the OpenAI-compatible `/v1` endpoint; the REST API lives one level up
-	return picked.baseURL.replace(/\/v1$/, "") + "/api/v1";
+	return {
+		base: picked.baseURL.replace(/\/v1$/, "") + "/api/v1",
+		apiKey: picked.apiKey,
+	};
 };
 
 export type ProcessedModel = InternalProcessedModel;
@@ -296,9 +309,7 @@ const buildRouterModelsRaw = async (): Promise<ModelConfig[]> => {
 		);
 	}
 	if (!response.ok) {
-		throw new Error(
-			`Failed to fetch ${baseURL}/models: ${response.status} ${response.statusText}`
-		);
+		throw new Error(`Failed to fetch ${baseURL}/models: ${response.status} ${response.statusText}`);
 	}
 	const json = await response.json();
 	logger.info({ keys: Object.keys(json || {}) }, "[models] Response keys");
