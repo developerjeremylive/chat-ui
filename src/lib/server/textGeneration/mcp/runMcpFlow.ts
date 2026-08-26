@@ -28,6 +28,9 @@ import { makeImageProcessor } from "$lib/server/endpoints/images";
 import { logger } from "$lib/server/logger";
 import { AbortedGenerations } from "$lib/server/abortedGenerations";
 import { withoutContentLength } from "$lib/server/undiciCompat";
+import { isMlAssistantConversation, withMlAssistantServers } from "$lib/server/mlAssistant";
+import { getEnabledBuiltinTools, shouldSkipMcpFlow } from "../builtinTools";
+import { injectPlanState, PLAN_TOOL_NAME } from "../builtinTools/planTool";
 
 export type RunMcpFlowContext = Pick<
 	TextGenerationContext,
@@ -55,6 +58,13 @@ export type McpFlowResult =
 	| "awaiting_input";
 
 const MAX_TOOL_ROUNDS = 10;
+
+// ML Assistant runs jobs, and the round budget is what it spends grounding ids,
+// auditing a dataset, reading a working example and then submitting: ten does not
+// survive one training task, and exhausting the budget ends the turn with an
+// apology instead of an answer. Only the preset gets the larger budget — an
+// ordinary conversation that loops is still stopped early.
+const ML_ASSISTANT_MAX_TOOL_ROUNDS = 100;
 
 // Each retry costs a tool round, so give up quickly and answer without the tool.
 const MAX_TRUNCATED_TOOL_CALL_RETRIES = 2;
@@ -96,6 +106,11 @@ export async function* runMcpFlow({
 		}
 		return false;
 	};
+	const builtinTools = getEnabledBuiltinTools({ conv });
+	// Read once: the preset decides the servers, the round budget and which tool
+	// doctrine is sent, and they must all agree within a run.
+	const mlAssistant = isMlAssistantConversation(conv);
+
 	// Start from env-configured servers
 	let servers = getMcpServers();
 	try {
@@ -158,9 +173,22 @@ export async function* runMcpFlow({
 		// ignore selection merge errors and proceed with env servers
 	}
 
+	// The preset's servers go on after the user's selection has been filtered, so
+	// they survive a selection that excludes them. Anything the user picked on top
+	// still comes through — extra servers are configurable, these are not.
+	if (mlAssistant) {
+		servers = withMlAssistantServers(servers);
+		try {
+			logger.debug(
+				{ servers: servers.map((s) => s.name) },
+				"[mcp] applied ML Assistant preset servers"
+			);
+		} catch {}
+	}
+
 	// If selection/merge yielded no servers, bail early with clearer log
-	if (servers.length === 0) {
-		logger.warn({}, "[mcp] no MCP servers selected after merge/name filter");
+	if (shouldSkipMcpFlow(servers.length, builtinTools.length)) {
+		logger.warn({}, "[mcp] no MCP servers selected after merge/name filter, and no builtin tools");
 		return "not_applicable";
 	}
 
@@ -184,7 +212,7 @@ export async function* runMcpFlow({
 			}
 		} catch {}
 	}
-	if (servers.length === 0) {
+	if (shouldSkipMcpFlow(servers.length, builtinTools.length)) {
 		logger.warn({}, "[mcp] all selected MCP servers rejected by URL safety guard");
 		return "not_applicable";
 	}
@@ -253,7 +281,7 @@ export async function* runMcpFlow({
 		{ count: servers.length, servers: servers.map((s) => s.name) },
 		"[mcp] servers configured"
 	);
-	if (servers.length === 0) {
+	if (shouldSkipMcpFlow(servers.length, builtinTools.length)) {
 		return "not_applicable";
 	}
 
@@ -315,9 +343,23 @@ export async function* runMcpFlow({
 	let producedOutput = false;
 
 	try {
-		const { tools: oaTools, mapping } = await getOpenAiToolsForMcp(servers, {
+		const { tools: mcpTools, mapping } = await getOpenAiToolsForMcp(servers, {
 			signal: abortSignal,
 		});
+		// An MCP tool that collides with a builtin name is dropped: dispatch checks
+		// builtins first, so the MCP twin would be advertised but unreachable.
+		const builtinNames = new Set(builtinTools.map((tool) => tool.name));
+		const collisions = mcpTools.filter((tool) => builtinNames.has(tool.function.name));
+		if (collisions.length > 0) {
+			logger.warn(
+				{ dropped: collisions.map((tool) => tool.function.name) },
+				"[mcp] dropped MCP tools shadowed by builtin tools"
+			);
+		}
+		const oaTools = [
+			...builtinTools.map((tool) => tool.definition),
+			...mcpTools.filter((tool) => !builtinNames.has(tool.function.name)),
+		];
 		try {
 			logger.info(
 				{ toolCount: oaTools.length, toolNames: oaTools.map((t) => t.function.name) },
@@ -417,7 +459,13 @@ export async function* runMcpFlow({
 			}
 		);
 		const userTimezone = (locals as unknown as { timezone?: string })?.timezone;
-		const toolPreprompt = buildToolPreprompt(oaTools, userTimezone);
+		// In the mode the doctrine paragraphs are swapped, not appended to: the
+		// generic restraint rule tells the model not to reach for a tool unless it
+		// lacks a capability, and names writing code as a case to answer directly,
+		// which is the inverse of the preset's doctrine.
+		const toolPreprompt = buildToolPreprompt(oaTools, userTimezone, builtinTools, {
+			mlAssistant,
+		});
 		const prepromptPieces: string[] = [];
 		if (toolPreprompt.trim().length > 0) {
 			prepromptPieces.push(toolPreprompt);
@@ -435,6 +483,13 @@ export async function* runMcpFlow({
 			}
 		} else if (mergedPreprompt.length > 0) {
 			messagesOpenAI = [{ role: "system", content: mergedPreprompt }, ...messagesOpenAI];
+		}
+
+		// Tail-injected once per turn; within the turn, freshness travels in the tool
+		// results. Gated on the tool being offered so a stale plan can't tell the model
+		// to call a tool it doesn't have.
+		if (conv.plan && builtinTools.some((tool) => tool.name === PLAN_TOOL_NAME)) {
+			messagesOpenAI = injectPlanState(messagesOpenAI, conv.plan);
 		}
 
 		// Work around servers that reject `system` role
@@ -498,6 +553,8 @@ export async function* runMcpFlow({
 			sources: { index: number; link: string }[];
 		} => ({ annotated: text, sources: [] });
 
+		const maxToolRounds = mlAssistant ? ML_ASSISTANT_MAX_TOOL_ROUNDS : MAX_TOOL_ROUNDS;
+
 		let lastAssistantContent = "";
 		let streamedContent = false;
 		// Track whether we're inside a <think> block when the upstream streams
@@ -522,7 +579,7 @@ export async function* runMcpFlow({
 			);
 		}
 
-		for (let loop = 0; loop < MAX_TOOL_ROUNDS; loop += 1) {
+		for (let loop = 0; loop < maxToolRounds; loop += 1) {
 			// Check for abort at the start of each loop iteration
 			if (checkAborted()) {
 				logger.info({ loop }, "[mcp] aborting at start of loop iteration");
@@ -847,6 +904,14 @@ export async function* runMcpFlow({
 					roundReasoning: reasoningForToolMsg,
 					roundContent: assistantContentForToolMsg,
 					elicitation: { conversationId: conv._id, generationId, messageId },
+					// A parked call resumes with no request behind it, so the identity it
+					// should act as has to be recorded now, while there still is one.
+					owner: {
+						userId: (locals as unknown as { user?: { _id?: import("mongodb").ObjectId } })?.user
+							?._id,
+						sessionId: (locals as unknown as { sessionId?: string })?.sessionId,
+					},
+					builtinTools,
 				});
 				let toolMsgCount = 0;
 				let toolRunCount = 0;
@@ -916,7 +981,7 @@ export async function* runMcpFlow({
 		}
 		// Not "not_applicable": that re-runs the turn with no tools and discards every
 		// tool result this turn produced.
-		logger.warn({ maxRounds: MAX_TOOL_ROUNDS }, "[mcp] tool-round budget exhausted");
+		logger.warn({ maxRounds: maxToolRounds }, "[mcp] tool-round budget exhausted");
 		const exhaustedText =
 			lastAssistantContent.trim().length > 0
 				? lastAssistantContent
